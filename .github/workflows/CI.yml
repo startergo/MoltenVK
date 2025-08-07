@@ -7,6 +7,30 @@ on:
   pull_request:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - macos
+          - ios
+      xcode_version:
+        description: 'Xcode version to use (leave empty for default)'
+        required: false
+        type: string
+      upload_artifacts:
+        description: 'Upload build artifacts'
+        required: true
+        default: true
+        type: boolean
+      use_legacy_build:
+        description: 'Include legacy macOS-13 build'
+        required: true
+        default: false
+        type: boolean
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 # See the following, which includes links to supported macOS versions, including supported Xcode versions
@@ -38,23 +62,51 @@ jobs:
       XCODE_DEV_PATH: "/Applications/Xcode_${{ matrix.xcode }}.app/Contents/Developer"
 
     steps:
+      # Check if this job should run based on workflow_dispatch inputs
+      - name: Check if job should run
+        id: should_run
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # For workflow_dispatch, check input parameters
+            if [[ "${{ github.event.inputs.platform }}" != "all" && "${{ github.event.inputs.platform }}" != "${{ matrix.platform }}" ]]; then
+              echo "Skipping build - platform mismatch"
+              echo "should_run=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            if [[ "${{ github.event.inputs.use_legacy_build }}" != "true" && "${{ matrix.os }}" == "macos-13" ]]; then
+              echo "Skipping legacy build - not requested"
+              echo "should_run=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          echo "should_run=true" >> $GITHUB_OUTPUT
+
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v4
+        if: steps.should_run.outputs.should_run == 'true'
 
       # Python 3.12 removed distutils, which is used by glslang::update_glslang_sources.py called from fetchDependencies
       - uses: actions/setup-python@v5
+        if: steps.should_run.outputs.should_run == 'true'
         with:
           python-version: '3.11'
 
       - name: List available Xcode versions
+        if: steps.should_run.outputs.should_run == 'true'
         run: ls /Applications | grep Xcode
 
       - name: Select Xcode version
-        if: matrix.select_xcode == true
-        run: sudo xcode-select -switch "${XCODE_DEV_PATH}"
+        if: steps.should_run.outputs.should_run == 'true' && (matrix.select_xcode == true || (github.event_name == 'workflow_dispatch' && github.event.inputs.xcode_version != ''))
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.xcode_version }}" != "" ]]; then
+            sudo xcode-select -switch "/Applications/Xcode_${{ github.event.inputs.xcode_version }}.app/Contents/Developer"
+          else
+            sudo xcode-select -switch "${XCODE_DEV_PATH}"
+          fi
 
       - name: Prep
         id: prep
+        if: steps.should_run.outputs.should_run == 'true'
         run: |
           echo "Get Xcode version info"
           XCODE_VERSION="$(xcodebuild -version)"
@@ -65,7 +117,7 @@ jobs:
 
       - name: Cache Dependencies
         id: cache-dependencies
-        if: success() && !(github.event_name == 'push' && contains(github.ref, 'refs/tags/')) # never cache dependencies for pushed tags
+        if: steps.should_run.outputs.should_run == 'true' && success() && !(github.event_name == 'push' && contains(github.ref, 'refs/tags/')) # never cache dependencies for pushed tags
         uses: actions/cache@v3
         with:
           path: |
@@ -74,32 +126,33 @@ jobs:
           key: ${{ runner.os }}-${{ steps.prep.outputs.XCODE_VERSION }}-${{ matrix.platform }}-${{ hashFiles('fetchDependencies','ExternalRevisions/**','ExternalDependencies.xcodeproj/**','Scripts/**') }}
 
       - name: Fetch Dependencies (Use Built Cache)
-        if: steps.cache-dependencies.outputs.cache-hit == 'true'
+        if: steps.should_run.outputs.should_run == 'true' && steps.cache-dependencies.outputs.cache-hit == 'true'
         run: |
           ./fetchDependencies -v --none
 
       - name: Fetch Dependencies
-        if: steps.cache-dependencies.outputs.cache-hit != 'true'
+        if: steps.should_run.outputs.should_run == 'true' && steps.cache-dependencies.outputs.cache-hit != 'true'
         run: |
           ./fetchDependencies -v --${{ matrix.platform }}
 
       - name: Output Dependency Build Logs on Failure
-        if: failure()
+        if: steps.should_run.outputs.should_run == 'true' && failure()
         run: cat "dependenciesbuild.log"
 
       - name: Build MoltenVK
+        if: steps.should_run.outputs.should_run == 'true'
         run: |
           make ${{ matrix.platform }}
 
       - name: Output MoltenVK Build Logs on Failure
-        if: failure()
+        if: steps.should_run.outputs.should_run == 'true' && failure()
         run: |
           if [ -f "xcodebuild.log" ]; then
             cat "xcodebuild.log"
           fi
 
       - name: Tar Artifacts
-        if: success() && matrix.upload_artifacts == true
+        if: steps.should_run.outputs.should_run == 'true' && success() && (matrix.upload_artifacts == true || (github.event_name == 'workflow_dispatch' && github.event.inputs.upload_artifacts == 'true'))
         # See: https://github.com/actions/upload-artifact#maintaining-file-permissions-and-case-sensitive-files
         # To reduce artifact size, don't include any stand-alone shader converter binaries.
         run: |
@@ -107,7 +160,7 @@ jobs:
           tar -C Package -s/Release/MoltenVK/ -cvf "MoltenVK-${{ matrix.platform }}.tar" Release/
 
       - name: Upload Artifacts
-        if: success() && matrix.upload_artifacts == true
+        if: steps.should_run.outputs.should_run == 'true' && success() && (matrix.upload_artifacts == true || (github.event_name == 'workflow_dispatch' && github.event.inputs.upload_artifacts == 'true'))
         uses: actions/upload-artifact@v4
         with:
           name: "MoltenVK-${{ matrix.platform }}"
