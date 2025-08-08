@@ -31,6 +31,15 @@ on:
         required: true
         default: false
         type: boolean
+      create_release:
+        description: 'Create a release (requires tag name)'
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: 'Release tag name (e.g., v1.2.3)'
+        required: false
+        type: string
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 # See the following, which includes links to supported macOS versions, including supported Xcode versions
@@ -173,12 +182,23 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    if: ${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true') }}
 
     permissions:
       contents: write
 
     steps:
+      - name: Validate manual release inputs
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true' }}
+        run: |
+          if [[ -z "${{ github.event.inputs.release_tag }}" ]]; then
+            echo "Error: release_tag is required when create_release is true"
+            exit 1
+          fi
+          if [[ ! "${{ github.event.inputs.release_tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
+            echo "Warning: release_tag should follow semantic versioning (e.g., v1.2.3)"
+          fi
+
       - name: Download Artifacts
         uses: actions/download-artifact@v4
 
@@ -197,3 +217,8 @@ jobs:
           # Upload all MoltenVK CI artifacts as release assets.
           artifacts: "MoltenVK*/*"
           artifactErrorsFailBuild: true
+          # Use manual tag if provided, otherwise extract from git ref
+          tag: ${{ github.event.inputs.release_tag || github.ref_name }}
+          # Create the tag if it doesn't exist (for manual dispatch)
+          makeLatest: true
+          generateReleaseNotes: true
